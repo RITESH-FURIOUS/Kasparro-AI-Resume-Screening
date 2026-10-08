@@ -7,7 +7,7 @@ from src.eligibility.filter import evaluate_eligibility
 from src.extraction.deterministic import extract_deterministic_evidence
 from src.extraction.llm_extractor import extract_candidate_evidence
 from src.github.client import GitHubClient
-from src.ingestion.loader import discover_resume_files, load_resume
+from src.ingestion.loader import load_all_resumes
 from src.schemas import (
     CandidateEvidence,
     DecisionTrace,
@@ -23,77 +23,217 @@ from src.scoring.score import calculate_score
 
 
 class ResumeScreeningPipeline:
+    """
+    End-to-end batch-safe resume screening pipeline.
+
+    Core principle:
+
+        LLM understands the resume.
+        Python makes the final decision.
+    """
 
     def __init__(self, enable_github: bool = True):
         self.enable_github = enable_github
         self.github_client = (
-            GitHubClient() if enable_github else None
+            GitHubClient()
+            if enable_github
+            else None
         )
 
-    def _build_deterministic_context(
+    # ------------------------------------------------------------------
+    # GitHub
+    # ------------------------------------------------------------------
+
+    def _empty_github_summary(
         self,
-        deterministic: Any,
-    ) -> str:
-
-        parts: list[str] = []
-
-        normalized_text = getattr(
-            deterministic,
-            "normalized_text",
-            "",
+        reason: str | None = None,
+    ) -> GitHubSummary:
+        return GitHubSummary(
+            available=False,
+            username=None,
+            public_repositories=0,
+            recent_activity_score=0.0,
+            relevant_repositories_score=0.0,
+            summary=reason or "GitHub enrichment unavailable.",
+            concerns=[reason] if reason else [],
         )
 
-        if normalized_text:
-            parts.append(normalized_text)
+    def _convert_github_result(
+        self,
+        github_result: Any,
+    ) -> GitHubSummary:
 
-        technologies = getattr(
-            deterministic,
-            "technologies",
-            {},
-        )
-
-        if technologies:
-            parts.append(
-                "Detected technologies: "
-                + ", ".join(
-                    str(key)
-                    for key in technologies.keys()
-                )
+        if github_result is None:
+            return self._empty_github_summary(
+                "GitHub enrichment returned no result."
             )
 
-        ai_signals = getattr(
-            deterministic,
-            "ai_signals",
-            [],
+        username = getattr(
+            github_result,
+            "username",
+            None,
         )
 
-        if ai_signals:
-            parts.append(
-                "Detected AI signals: "
-                + ", ".join(
-                    str(signal)
-                    for signal in ai_signals
+        repositories = getattr(
+            github_result,
+            "repositories",
+            None,
+        ) or []
+
+        try:
+            public_repository_count = len(repositories)
+        except TypeError:
+            public_repository_count = 0
+
+        available = bool(
+            getattr(
+                github_result,
+                "available",
+                False,
+            )
+        )
+
+        if not available and username:
+            available = True
+
+        recent_activity_score = float(
+            getattr(
+                github_result,
+                "recent_activity_score",
+                0.0,
+            )
+            or 0.0
+        )
+
+        relevant_repositories_score = float(
+            getattr(
+                github_result,
+                "relevant_repository_score",
+                0.0,
+            )
+            or 0.0
+        )
+
+        recent_activity_score = max(
+            0.0,
+            min(5.0, recent_activity_score),
+        )
+
+        relevant_repositories_score = max(
+            0.0,
+            min(5.0, relevant_repositories_score),
+        )
+
+        summary = (
+            getattr(
+                github_result,
+                "summary",
+                "",
+            )
+            or ""
+        )
+
+        error = getattr(
+            github_result,
+            "error",
+            None,
+        )
+
+        concerns: list[str] = []
+
+        if error:
+            concerns.append(str(error))
+
+        if not summary:
+            if available:
+                summary = (
+                    "GitHub profile found with "
+                    f"{public_repository_count} public repositories."
                 )
+            else:
+                summary = (
+                    "GitHub profile unavailable or no public "
+                    "repository evidence found."
+                )
+
+        return GitHubSummary(
+            available=available,
+            username=username,
+            public_repositories=public_repository_count,
+            recent_activity_score=recent_activity_score,
+            relevant_repositories_score=relevant_repositories_score,
+            summary=summary,
+            concerns=concerns,
+        )
+
+    def _enrich_github(
+        self,
+        candidate: CandidateEvidence,
+    ) -> GitHubSummary:
+
+        if not self.enable_github:
+            return self._empty_github_summary(
+                "GitHub enrichment is disabled."
             )
 
-        return "\n".join(parts)
+        if self.github_client is None:
+            return self._empty_github_summary(
+                "GitHub client is unavailable."
+            )
 
+        if not candidate.github_url:
+            return self._empty_github_summary(
+                "No GitHub profile URL was found in the resume."
+            )
+
+        try:
+            github_result = self.github_client.enrich(
+                candidate.github_url
+            )
+
+            return self._convert_github_result(
+                github_result
+            )
+
+        except Exception as exc:
+            return self._empty_github_summary(
+                f"GitHub enrichment failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
     def _matched_skills(
-        self,
         candidate: CandidateEvidence,
     ) -> list[str]:
 
-        return sorted(
-            {
-                str(skill).strip()
-                for skill in candidate.skills
-                if str(skill).strip()
-            },
-            key=str.lower,
-        )
+        seen: set[str] = set()
+        result: list[str] = []
 
+        for skill in candidate.skills:
+            if not skill:
+                continue
+
+            cleaned = skill.strip()
+
+            if not cleaned:
+                continue
+
+            key = cleaned.lower()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(cleaned)
+
+        return result
+
+    @staticmethod
     def _project_summaries(
-        self,
         candidate: CandidateEvidence,
     ) -> list[str]:
 
@@ -101,456 +241,350 @@ class ResumeScreeningPipeline:
 
         for project in candidate.projects:
 
-            description = project.description.strip()
+            name = getattr(
+                project,
+                "name",
+                "Unnamed project",
+            )
+
+            description = getattr(
+                project,
+                "description",
+                "",
+            )
+
+            technologies = getattr(
+                project,
+                "technologies",
+                [],
+            )
+
+            parts: list[str] = []
 
             if description:
+                parts.append(
+                    description.strip()
+                )
+
+            if technologies:
+                tech_text = ", ".join(
+                    str(item)
+                    for item in technologies
+                    if item
+                )
+
+                if tech_text:
+                    parts.append(
+                        f"Technologies: {tech_text}"
+                    )
+
+            if parts:
                 summaries.append(
-                    f"{project.name}: {description}"
+                    f"{name}: " + " | ".join(parts)
                 )
             else:
-                summaries.append(project.name)
+                summaries.append(str(name))
 
         return summaries
 
-    def _build_evidence(
-        self,
+    @staticmethod
+    def _candidate_evidence_dict(
         candidate: CandidateEvidence,
     ) -> dict[str, Any]:
 
-        return {
-            "python": [
-                item.model_dump(mode="json")
-                for item in candidate.python_evidence
-            ],
-            "ai": [
-                item.model_dump(mode="json")
-                for item in candidate.ai_evidence
-            ],
-            "backend": [
-                item.model_dump(mode="json")
-                for item in candidate.backend_evidence
-            ],
-            "cloud": [
-                item.model_dump(mode="json")
-                for item in candidate.cloud_evidence
-            ],
-            "frontend": [
-                item.model_dump(mode="json")
-                for item in candidate.frontend_evidence
-            ],
-            "github": [
-                item.model_dump(mode="json")
-                for item in candidate.github_evidence
-            ],
-        }
+        return candidate.model_dump(
+            mode="json"
+        )
 
-    def _decision_trace(
+    # ------------------------------------------------------------------
+    # Candidate processing
+    # ------------------------------------------------------------------
+
+    def _process_candidate(
         self,
-        candidate: CandidateEvidence,
-        eligible: bool,
-        project_quality: Any | None = None,
-        github_summary: GitHubSummary | None = None,
-    ) -> DecisionTrace:
+        loaded_resume: Any,
+    ) -> tuple[
+        RankedCandidate | RejectedCandidate | None,
+        ProcessingFailure | None,
+    ]:
 
-        python_gate = (
-            "PASS: genuine Python evidence found."
-            if candidate.has_python_evidence
-            else "FAIL: no genuine Python evidence found."
-        )
-
-        ai_gate = (
-            "PASS: meaningful AI/LLM/agentic evidence found."
-            if candidate.has_ai_evidence
-            else "FAIL: no meaningful AI/LLM/agentic evidence found."
-        )
-
-        if project_quality is None:
-
-            project_depth = (
-                "Not evaluated because the candidate was rejected."
+        filename = Path(
+            str(
+                getattr(
+                    loaded_resume,
+                    "filename",
+                    "unknown",
+                )
             )
+        ).name
 
-        else:
-
-            depth = getattr(
-                project_quality,
-                "depth",
-                "UNKNOWN",
-            )
-
-            score = getattr(
-                project_quality,
-                "score",
-                0,
-            )
-
-            project_depth = (
-                f"AI project depth: {depth}; "
-                f"depth signal score: {score}."
-            )
-
-        if github_summary is None:
-
-            github_enrichment = (
-                "GitHub enrichment unavailable or disabled."
-            )
-
-        elif github_summary.error:
-
-            github_enrichment = (
-                "GitHub enrichment attempted but unavailable: "
-                f"{github_summary.error}"
-            )
-
-        else:
-
-            github_enrichment = (
-                "GitHub enrichment completed for "
-                f"{github_summary.username or 'unknown user'}."
-            )
-
-        ranking_status = (
-            "Candidate is eligible and included in ranking."
-            if eligible
-            else "Candidate is rejected and excluded from ranking."
-        )
-
-        return DecisionTrace(
-            python_gate=python_gate,
-            ai_gate=ai_gate,
-            project_depth=project_depth,
-            github_enrichment=github_enrichment,
-            ranking_status=ranking_status,
-        )
-
-    def _default_github_summary(
-        self,
-    ) -> GitHubSummary:
-
-        return GitHubSummary(
-            username=None,
-            profile_url=None,
-            public_repositories=0,
-            recent_activity_score=0.0,
-            relevant_repository_score=0.0,
-            score=0.0,
-            repositories=[],
-            error=None,
-        )
-
-    def _convert_github_summary(
-        self,
-        summary: Any,
-    ) -> GitHubSummary:
-
-        if isinstance(
-            summary,
-            GitHubSummary,
-        ):
-            return summary
-
-        repositories = []
-
-        for repo in (
+        resume_text = str(
             getattr(
-                summary,
-                "repositories",
-                [],
+                loaded_resume,
+                "text",
+                "",
             )
-            or []
-        ):
-
-            if hasattr(
-                repo,
-                "__dict__",
-            ):
-
-                repositories.append(
-                    dict(repo.__dict__)
-                )
-
-            elif isinstance(
-                repo,
-                dict,
-            ):
-
-                repositories.append(repo)
-
-            else:
-
-                repositories.append(
-                    str(repo)
-                )
-
-        return GitHubSummary(
-            username=getattr(
-                summary,
-                "username",
-                None,
-            ),
-            profile_url=getattr(
-                summary,
-                "profile_url",
-                None,
-            ),
-            public_repositories=int(
-                getattr(
-                    summary,
-                    "public_repositories",
-                    0,
-                )
-                or 0
-            ),
-            recent_activity_score=float(
-                getattr(
-                    summary,
-                    "recent_activity_score",
-                    0.0,
-                )
-                or 0.0
-            ),
-            relevant_repository_score=float(
-                getattr(
-                    summary,
-                    "relevant_repository_score",
-                    0.0,
-                )
-                or 0.0
-            ),
-            score=float(
-                getattr(
-                    summary,
-                    "score",
-                    0.0,
-                )
-                or 0.0
-            ),
-            repositories=repositories,
-            error=getattr(
-                summary,
-                "error",
-                None,
-            ),
         )
-
-    def _process_one(
-        self,
-        resume_path: Path,
-    ) -> RankedCandidate | RejectedCandidate:
-
-        loaded_resume = load_resume(
-            resume_path
-        )
-
-        deterministic = extract_deterministic_evidence(
-            loaded_resume
-        )
-
-        # The LLM extractor already receives the resume
-        # and deterministic evidence. It does not accept
-        # a separate "context" keyword argument.
-        candidate = extract_candidate_evidence(
-            loaded_resume.text,
-            deterministic,
-        )
-
-        eligibility = evaluate_eligibility(
-            candidate
-        )
-
-        evidence = self._build_evidence(
-            candidate
-        )
-
-        evidence["python_gate"] = {
-            "status": (
-                "PASS"
-                if candidate.has_python_evidence
-                else "FAIL"
-            ),
-            "reason": (
-                "Genuine Python evidence found."
-                if candidate.has_python_evidence
-                else (
-                    "No genuine Python evidence found "
-                    "in projects, internships, or work experience."
-                )
-            ),
-        }
-
-        evidence["ai_gate"] = {
-            "status": (
-                "PASS"
-                if candidate.has_ai_evidence
-                else "FAIL"
-            ),
-            "reason": (
-                "Meaningful AI/LLM/agentic evidence found."
-                if candidate.has_ai_evidence
-                else (
-                    "No meaningful AI/LLM/agentic "
-                    "implementation evidence found."
-                )
-            ),
-        }
-
-        if eligibility.status.value != "ELIGIBLE":
-
-            return RejectedCandidate(
-                name=candidate.name,
-                email=candidate.email,
-                eligible=False,
-                rejection_reason=eligibility.reason,
-                missing_requirements=(
-                    eligibility.missing_requirements
-                ),
-                matched_requirements=(
-                    eligibility.matched_requirements
-                ),
-                evidence=evidence,
-            )
-
-        project_quality = evaluate_project_quality(
-            candidate
-        )
-
-        github_summary = (
-            self._default_github_summary()
-        )
-
-        if (
-            self.enable_github
-            and self.github_client is not None
-            and candidate.github_url
-        ):
-
-            try:
-
-                raw_github_summary = (
-                    self.github_client.summarize(
-                        candidate.github_url
-                    )
-                )
-
-                github_summary = (
-                    self._convert_github_summary(
-                        raw_github_summary
-                    )
-                )
-
-            except Exception as exc:
-
-                github_summary = GitHubSummary(
-                    username=None,
-                    profile_url=candidate.github_url,
-                    public_repositories=0,
-                    recent_activity_score=0.0,
-                    relevant_repository_score=0.0,
-                    score=0.0,
-                    repositories=[],
-                    error=(
-                        f"GitHub enrichment failed: {exc}"
-                    ),
-                )
-
-        score_breakdown = calculate_score(
-            candidate=candidate,
-            project_quality=project_quality,
-            github_score=github_summary.score,
-        )
-
-        total_score = round(
-            score_breakdown.ai_agentic_rag
-            + score_breakdown.python_backend
-            + score_breakdown.cloud_full_stack
-            + score_breakdown.github_activity
-            + score_breakdown.engineering_depth,
-            2,
-        )
-
-        decision_trace = self._decision_trace(
-            candidate=candidate,
-            eligible=True,
-            project_quality=project_quality,
-            github_summary=github_summary,
-        )
-
-        return RankedCandidate(
-            rank=0,
-            name=candidate.name,
-            email=candidate.email,
-            eligible=True,
-            total_score=total_score,
-            score_breakdown=score_breakdown,
-            matched_skills=self._matched_skills(
-                candidate
-            ),
-            project_summary=self._project_summaries(
-                candidate
-            ),
-            github_summary=github_summary,
-            strengths=candidate.strengths,
-            concerns=candidate.concerns,
-            evidence=evidence,
-            decision_trace=decision_trace,
-        )
-
-    def process_resume(
-        self,
-        resume_path: Path,
-    ) -> (
-        RankedCandidate
-        | RejectedCandidate
-        | ProcessingFailure
-    ):
-
-        filename = resume_path.name
 
         try:
 
-            return self._process_one(
-                resume_path
+            if not resume_text.strip():
+                return (
+                    None,
+                    ProcessingFailure(
+                        filename=filename,
+                        stage="ingestion",
+                        message="Resume produced no readable text.",
+                        error_type="EmptyResumeText",
+                    ),
+                )
+
+            # ----------------------------------------------------------
+            # 1. Deterministic extraction
+            #
+            # IMPORTANT:
+            # extract_deterministic_evidence() expects LoadedResume,
+            # NOT a string.
+            # ----------------------------------------------------------
+
+            deterministic = extract_deterministic_evidence(
+                loaded_resume
             )
+
+            # ----------------------------------------------------------
+            # 2. Structured LLM/fallback extraction
+            #
+            # LLM extractor expects raw resume text plus the
+            # deterministic evidence object.
+            # ----------------------------------------------------------
+
+            candidate = extract_candidate_evidence(
+                resume_text,
+                deterministic,
+            )
+
+            # ----------------------------------------------------------
+            # 3. Hard eligibility gate
+            # ----------------------------------------------------------
+
+            eligibility = evaluate_eligibility(
+                candidate
+            )
+
+            # ----------------------------------------------------------
+            # 4. Reject immediately if requirements fail
+            # ----------------------------------------------------------
+
+            if (
+                eligibility.status.value.upper()
+                != "ELIGIBLE"
+            ):
+
+                missing_requirements: list[str] = []
+
+                if not eligibility.python_gate:
+                    missing_requirements.append(
+                        "Python evidence"
+                    )
+
+                if not eligibility.ai_gate:
+                    missing_requirements.append(
+                        "AI/LLM/agentic evidence"
+                    )
+
+                matched_requirements: list[str] = []
+
+                if eligibility.python_gate:
+                    matched_requirements.append(
+                        "Python evidence"
+                    )
+
+                if eligibility.ai_gate:
+                    matched_requirements.append(
+                        "AI/LLM/agentic evidence"
+                    )
+
+                rejected = RejectedCandidate(
+                    name=candidate.name,
+                    email=candidate.email,
+                    eligible=False,
+                    rejection_reason=eligibility.reason,
+                    missing_requirements=missing_requirements,
+                    matched_requirements=matched_requirements,
+                    evidence=self._candidate_evidence_dict(
+                        candidate
+                    ),
+                )
+
+                return rejected, None
+
+            # ----------------------------------------------------------
+            # 5. Project quality
+            # ----------------------------------------------------------
+
+            project_quality = evaluate_project_quality(
+                candidate
+            )
+
+            # ----------------------------------------------------------
+            # 6. GitHub enrichment
+            # ----------------------------------------------------------
+
+            github_summary = self._enrich_github(
+                candidate
+            )
+
+            github_score = (
+                github_summary.recent_activity_score
+                + github_summary.relevant_repositories_score
+            )
+
+            github_score = max(
+                0.0,
+                min(10.0, github_score),
+            )
+
+            # ----------------------------------------------------------
+            # 7. Deterministic scoring
+            # ----------------------------------------------------------
+
+            score = calculate_score(
+                candidate,
+                github_score=github_score,
+            )
+
+            score_values = score.model_dump(
+                mode="python"
+            )
+
+            total_score = round(
+                sum(
+                    float(value)
+                    for value in score_values.values()
+                ),
+                2,
+            )
+
+            # ----------------------------------------------------------
+            # 8. Decision trace
+            # ----------------------------------------------------------
+
+            decision_trace = DecisionTrace(
+                python_gate=(
+                    "PASS — genuine Python evidence found."
+                    if eligibility.python_gate
+                    else "FAIL — no genuine Python evidence found."
+                ),
+                ai_gate=(
+                    "PASS — meaningful AI/LLM/agentic evidence found."
+                    if eligibility.ai_gate
+                    else "FAIL — no meaningful AI/LLM/agentic evidence found."
+                ),
+                project_depth=(
+                    f"{project_quality.level} — "
+                    f"depth score "
+                    f"{project_quality.depth_score:.1f}; "
+                    f"{project_quality.reasoning}"
+                ),
+                github_enrichment=github_summary.summary,
+                ranking_status=(
+                    f"Eligible candidate scored "
+                    f"{total_score:.1f}/100."
+                ),
+            )
+
+            # ----------------------------------------------------------
+            # 9. Final candidate
+            # ----------------------------------------------------------
+
+            ranked = RankedCandidate(
+                rank=0,
+                name=candidate.name,
+                email=candidate.email,
+                eligible=True,
+                total_score=total_score,
+                score_breakdown=score,
+                matched_skills=self._matched_skills(
+                    candidate
+                ),
+                project_summary=self._project_summaries(
+                    candidate
+                ),
+                github_summary=github_summary,
+                strengths=list(candidate.strengths),
+                concerns=list(candidate.concerns),
+                evidence=self._candidate_evidence_dict(
+                    candidate
+                ),
+                decision_trace=decision_trace,
+            )
+
+            return ranked, None
 
         except Exception as exc:
 
-            return ProcessingFailure(
+            failure = ProcessingFailure(
                 filename=filename,
                 stage="processing",
                 message=str(exc),
                 error_type=type(exc).__name__,
             )
 
+            return None, failure
+
+    # ------------------------------------------------------------------
+    # Batch processing
+    # ------------------------------------------------------------------
+
     def run(
         self,
-        input_dir: Path,
+        input_dir: str | Path,
     ) -> ScreeningResults:
 
-        input_dir = Path(
-            input_dir
+        input_path = Path(input_dir)
+
+        # Loader returns:
+        #
+        #   loaded resumes
+        #   ingestion failures
+        #
+        loaded_resumes, ingestion_failures = load_all_resumes(
+            input_path
         )
 
-        resume_files = discover_resume_files(
-            input_dir
-        )
+        ranked_candidates: list[RankedCandidate] = []
+        rejected_candidates: list[RejectedCandidate] = []
+        processing_failures: list[ProcessingFailure] = []
 
-        ranked_candidates: list[
-            RankedCandidate
-        ] = []
+        # Preserve ingestion failures.
+        for failure in ingestion_failures:
 
-        rejected_candidates: list[
-            RejectedCandidate
-        ] = []
-
-        processing_failures: list[
-            ProcessingFailure
-        ] = []
-
-        for resume_path in resume_files:
-
-            result = self.process_resume(
-                resume_path
+            processing_failures.append(
+                ProcessingFailure(
+                    filename=failure.filename,
+                    stage=failure.stage,
+                    message=failure.message,
+                    error_type=failure.error_type,
+                )
             )
+
+        processed = 0
+
+        for loaded_resume in loaded_resumes:
+
+            result, failure = self._process_candidate(
+                loaded_resume
+            )
+
+            if failure is not None:
+
+                processing_failures.append(
+                    failure
+                )
+
+                continue
+
+            processed += 1
 
             if isinstance(
                 result,
@@ -570,11 +604,9 @@ class ResumeScreeningPipeline:
                     result
                 )
 
-            else:
-
-                processing_failures.append(
-                    result
-                )
+        # --------------------------------------------------------------
+        # Final ranking
+        # --------------------------------------------------------------
 
         ranked_candidates.sort(
             key=lambda candidate: candidate.total_score,
@@ -585,30 +617,23 @@ class ResumeScreeningPipeline:
             ranked_candidates,
             start=1,
         ):
-
             candidate.rank = index
 
-        summary = RunSummary(
-            total_resumes=len(
-                resume_files
-            ),
-            processed=(
-                len(ranked_candidates)
-                + len(rejected_candidates)
-            ),
-            eligible=len(
-                ranked_candidates
-            ),
-            rejected=len(
-                rejected_candidates
-            ),
-            failed=len(
-                processing_failures
-            ),
+        total_resumes = (
+            len(loaded_resumes)
+            + len(ingestion_failures)
+        )
+
+        run_summary = RunSummary(
+            total_resumes=total_resumes,
+            processed=processed,
+            eligible=len(ranked_candidates),
+            rejected=len(rejected_candidates),
+            failed=len(processing_failures),
         )
 
         return ScreeningResults(
-            run_summary=summary,
+            run_summary=run_summary,
             ranked_candidates=ranked_candidates,
             rejected_candidates=rejected_candidates,
             processing_failures=processing_failures,

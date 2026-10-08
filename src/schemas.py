@@ -3,18 +3,17 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ============================================================
-# Enums
+# ENUMS
 # ============================================================
 
-
-class ProcessingStatus(str, Enum):
-    PROCESSED = "PROCESSED"
-    REJECTED = "REJECTED"
-    FAILED = "FAILED"
+class EvidenceStrength(str, Enum):
+    STRONG = "strong"
+    MODERATE = "moderate"
+    WEAK = "weak"
 
 
 class EligibilityStatus(str, Enum):
@@ -22,82 +21,62 @@ class EligibilityStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
-class EvidenceStrength(str, Enum):
-    NONE = "NONE"
-    WEAK = "WEAK"
-    MODERATE = "MODERATE"
-    STRONG = "STRONG"
+class ProcessingStatus(str, Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
 
 
 # ============================================================
-# Evidence
+# EVIDENCE
 # ============================================================
-
 
 class EvidenceItem(BaseModel):
     """
-    A concrete piece of resume evidence supporting a claim.
-
-    The system should prefer actual project/work evidence over
-    isolated keyword mentions.
+    A concrete claim extracted from a resume together with
+    the supporting resume text/evidence.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    claim: str = Field(
-        ...,
-        description="The capability or fact being supported.",
-    )
-
-    evidence: str = Field(
-        ...,
-        description="Exact or closely paraphrased evidence from the resume.",
-    )
-
-    source_section: str | None = Field(
-        default=None,
-        description="Section where the evidence was found, if identifiable.",
-    )
-
+    claim: str
+    evidence: str
+    source_section: str | None = None
     strength: EvidenceStrength = EvidenceStrength.MODERATE
 
 
-class SkillEvidence(BaseModel):
-    """
-    Evidence for a particular skill/category.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    present: bool = False
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-
-
 # ============================================================
-# Project Evidence
+# PROJECT EVIDENCE
 # ============================================================
-
 
 class ProjectEvidence(BaseModel):
     """
-    Structured representation of a project.
+    Structured representation of one candidate project.
 
-    The goal is not simply to detect words like 'AI'.
-    We want to understand what the project actually did.
+    Boolean signals are intentionally explicit because the LLM
+    should identify evidence, while deterministic Python logic
+    makes the final scoring decision.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = ""
 
     description: str = ""
 
-    technologies: list[str] = Field(default_factory=list)
+    technologies: list[str] = Field(
+        default_factory=list
+    )
+
+    # --------------------------------------------------------
+    # Core eligibility signals
+    # --------------------------------------------------------
 
     python_used: bool = False
-
     ai_or_llm_used: bool = False
+
+    # --------------------------------------------------------
+    # AI / Agentic / RAG depth signals
+    # --------------------------------------------------------
 
     llm: bool = False
     tool_calling: bool = False
@@ -106,23 +85,27 @@ class ProjectEvidence(BaseModel):
     embeddings: bool = False
     vector_search: bool = False
     rag: bool = False
+
     state_management: bool = False
     external_api: bool = False
     persistence: bool = False
     evaluation: bool = False
     validation: bool = False
-
     business_logic: bool = False
 
-    evidence: list[EvidenceItem] = Field(default_factory=list)
+    # --------------------------------------------------------
+    # Supporting evidence
+    # --------------------------------------------------------
+
+    evidence: list[EvidenceItem] = Field(
+        default_factory=list
+    )
 
     @property
     def ai_depth_signal_count(self) -> int:
         """
-        Number of meaningful AI/agentic implementation signals.
-
-        This is intentionally not the final score.
-        It is simply an intermediate quality signal.
+        Number of meaningful AI/engineering depth signals
+        present in this project.
         """
 
         signals = [
@@ -141,26 +124,29 @@ class ProjectEvidence(BaseModel):
             self.business_logic,
         ]
 
-        return sum(signals)
+        return sum(bool(signal) for signal in signals)
 
 
 # ============================================================
-# Candidate Evidence
+# CANDIDATE EVIDENCE
 # ============================================================
-
 
 class CandidateEvidence(BaseModel):
     """
-    Main evidence ledger for one candidate.
+    Structured evidence extracted from a complete resume.
 
-    The LLM can populate this structure, but eligibility and
-    scoring decisions will ultimately be made by deterministic
-    Python logic.
+    The LLM populates this structure. Eligibility and ranking
+    are subsequently determined by deterministic Python rules.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    # --------------------------------------------------------
+    # Identity / contact
+    # --------------------------------------------------------
+
     name: str = "Unknown"
+
     email: str | None = None
 
     phone: str | None = None
@@ -171,7 +157,17 @@ class CandidateEvidence(BaseModel):
 
     linkedin_url: str | None = None
 
-    skills: list[str] = Field(default_factory=list)
+    # --------------------------------------------------------
+    # Skills
+    # --------------------------------------------------------
+
+    skills: list[str] = Field(
+        default_factory=list
+    )
+
+    # --------------------------------------------------------
+    # Category-specific evidence
+    # --------------------------------------------------------
 
     python_evidence: list[EvidenceItem] = Field(
         default_factory=list
@@ -197,71 +193,128 @@ class CandidateEvidence(BaseModel):
         default_factory=list
     )
 
+    # --------------------------------------------------------
+    # Projects / experience
+    # --------------------------------------------------------
+
     projects: list[ProjectEvidence] = Field(
         default_factory=list
     )
 
-    internships: list[str] = Field(default_factory=list)
+    internships: list[str] = Field(
+        default_factory=list
+    )
 
-    experience: list[str] = Field(default_factory=list)
+    experience: list[str] = Field(
+        default_factory=list
+    )
 
-    certifications: list[str] = Field(default_factory=list)
+    certifications: list[str] = Field(
+        default_factory=list
+    )
 
-    education: list[str] = Field(default_factory=list)
+    education: list[str] = Field(
+        default_factory=list
+    )
+
+    # --------------------------------------------------------
+    # Human-readable summary
+    # --------------------------------------------------------
 
     summary: str = ""
 
-    concerns: list[str] = Field(default_factory=list)
+    concerns: list[str] = Field(
+        default_factory=list
+    )
 
-    strengths: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(
+        default_factory=list
+    )
+
+    # --------------------------------------------------------
+    # Deterministic eligibility helpers
+    # --------------------------------------------------------
 
     @property
     def has_python_evidence(self) -> bool:
-        return bool(self.python_evidence)
+        """
+        Python eligibility requires actual evidence rather than
+        Python appearing only as a keyword in a skills section.
+        """
+
+        if self.python_evidence:
+            return True
+
+        for project in self.projects:
+            if project.python_used:
+                return True
+
+        # Experience/internship evidence can also establish
+        # genuine Python usage.
+        python_terms = (
+            "python",
+            "flask",
+            "django",
+            "fastapi",
+            "pandas",
+            "numpy",
+            "tensorflow",
+            "pytorch",
+        )
+
+        experience_text = " ".join(
+            self.experience + self.internships
+        ).lower()
+
+        return any(
+            term in experience_text
+            for term in python_terms
+        )
 
     @property
     def has_ai_evidence(self) -> bool:
-        return bool(self.ai_evidence)
+        """
+        AI eligibility requires meaningful implementation evidence,
+        not merely an AI keyword in a skills list.
+        """
+
+        if self.ai_evidence:
+            return True
+
+        return any(
+            project.ai_or_llm_used
+            and project.ai_depth_signal_count >= 1
+            for project in self.projects
+        )
 
     @property
     def has_meaningful_ai_project(self) -> bool:
         """
-        Returns True when at least one project contains
+        Determines whether at least one project contains
         meaningful AI/LLM/agentic implementation evidence.
         """
 
-        for project in self.projects:
-            if not project.ai_or_llm_used:
-                continue
-
-            if project.ai_depth_signal_count >= 2:
-                return True
-
-        return False
+        return any(
+            project.ai_or_llm_used
+            and project.ai_depth_signal_count >= 2
+            for project in self.projects
+        )
 
 
 # ============================================================
-# Eligibility
+# ELIGIBILITY
 # ============================================================
-
 
 class EligibilityDecision(BaseModel):
-    """
-    Deterministic eligibility decision.
-
-    Python code will generate this after examining the
-    extracted evidence.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
     status: EligibilityStatus
 
-    python_gate: bool
+    python_gate: bool = False
 
-    ai_gate: bool
+    ai_gate: bool = False
 
-    reason: str
+    reason: str = ""
 
     matched_requirements: list[str] = Field(
         default_factory=list
@@ -273,41 +326,45 @@ class EligibilityDecision(BaseModel):
 
 
 # ============================================================
-# Project Quality
+# PROJECT QUALITY
 # ============================================================
-
 
 class ProjectQuality(BaseModel):
     """
-    Quality assessment of the candidate's AI/agentic work.
+    AI project depth classification.
 
-    This is an intermediate representation, not the final
-    100-point candidate score.
+    This is deliberately separate from the final score.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     level: str = "UNKNOWN"
 
-    depth_score: float = 0.0
+    depth_score: float = Field(
+        default=0.0,
+        ge=0,
+        le=10,
+    )
 
-    shallow_ai_penalty: float = 0.0
+    shallow_ai_penalty: float = Field(
+        default=0.0,
+        ge=0,
+    )
 
     reasoning: str = ""
 
-    signals: list[str] = Field(default_factory=list)
+    signals: list[str] = Field(
+        default_factory=list
+    )
 
 
 # ============================================================
-# Score Breakdown
+# SCORE BREAKDOWN
 # ============================================================
-
 
 class ScoreBreakdown(BaseModel):
     """
-    Final deterministic scoring breakdown.
-
-    Maximum = 100.
+    Deterministic 100-point scoring model.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -355,9 +412,8 @@ class ScoreBreakdown(BaseModel):
 
 
 # ============================================================
-# GitHub Enrichment
+# GITHUB
 # ============================================================
-
 
 class GitHubSummary(BaseModel):
     """
@@ -372,7 +428,13 @@ class GitHubSummary(BaseModel):
 
     username: str | None = None
 
+    profile_url: str | None = None
+
     public_repositories: int = 0
+
+    repositories: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
 
     recent_activity_score: float = Field(
         default=0.0,
@@ -386,56 +448,64 @@ class GitHubSummary(BaseModel):
         le=5,
     )
 
+    score: float = Field(
+        default=0.0,
+        ge=0,
+        le=10,
+    )
+
     summary: str = ""
 
-    concerns: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+    concerns: list[str] = Field(
+        default_factory=list
+    )
 
 
 # ============================================================
-# Decision Trace
+# DECISION TRACE
 # ============================================================
-
 
 class DecisionTrace(BaseModel):
     """
-    Human-readable trace of why the candidate reached a
-    particular final state.
+    Makes the final screening decision explainable.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    python_gate: str
+    python_gate: bool = False
 
-    ai_gate: str
+    ai_gate: bool = False
 
-    project_depth: str
+    project_depth: str = "UNKNOWN"
 
-    github_enrichment: str
+    github_enrichment: str = "not_run"
 
-    ranking_status: str
+    ranking_status: str = ""
 
 
 # ============================================================
-# Ranked Candidate
+# RANKED CANDIDATE
 # ============================================================
-
 
 class RankedCandidate(BaseModel):
-    """
-    Final candidate representation appearing in results.json.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
-    rank: int
+    rank: int = Field(
+        ge=1
+    )
 
-    name: str
+    name: str = "Unknown"
 
     email: str | None = None
 
-    eligible: bool
+    eligible: bool = True
 
-    total_score: float
+    total_score: float = Field(
+        ge=0,
+        le=100,
+    )
 
     score_breakdown: ScoreBreakdown
 
@@ -447,7 +517,9 @@ class RankedCandidate(BaseModel):
         default_factory=list
     )
 
-    github_summary: GitHubSummary
+    github_summary: GitHubSummary = Field(
+        default_factory=GitHubSummary
+    )
 
     strengths: list[str] = Field(
         default_factory=list
@@ -461,29 +533,25 @@ class RankedCandidate(BaseModel):
         default_factory=dict
     )
 
-    decision_trace: DecisionTrace
+    decision_trace: DecisionTrace = Field(
+        default_factory=DecisionTrace
+    )
 
 
 # ============================================================
-# Rejected Candidate
+# REJECTED CANDIDATE
 # ============================================================
-
 
 class RejectedCandidate(BaseModel):
-    """
-    Candidate who was processed successfully but failed
-    the mandatory Python + AI/LLM eligibility gate.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = "Unknown"
 
     email: str | None = None
 
     eligible: bool = False
 
-    rejection_reason: str
+    rejection_reason: str = ""
 
     missing_requirements: list[str] = Field(
         default_factory=list
@@ -499,21 +567,10 @@ class RejectedCandidate(BaseModel):
 
 
 # ============================================================
-# Processing Failure
+# PROCESSING FAILURE
 # ============================================================
 
-
 class ProcessingFailure(BaseModel):
-    """
-    A resume that could not be processed.
-
-    This is different from rejection.
-
-    REJECTED = processed successfully but not eligible.
-
-    FAILED = system could not reliably process the resume.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
     filename: str
@@ -528,34 +585,67 @@ class ProcessingFailure(BaseModel):
 
 
 # ============================================================
-# Batch Summary
+# RUN SUMMARY
 # ============================================================
-
 
 class RunSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    total_resumes: int = 0
+    total_resumes: int = Field(
+        ge=0
+    )
 
-    processed: int = 0
+    processed: int = Field(
+        ge=0
+    )
 
-    eligible: int = 0
+    eligible: int = Field(
+        ge=0
+    )
 
-    rejected: int = 0
+    rejected: int = Field(
+        ge=0
+    )
 
-    failed: int = 0
+    failed: int = Field(
+        ge=0
+    )
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "RunSummary":
+        """
+        The counters should always add up to the total number
+        of discovered resumes.
+        """
+
+        if (
+            self.processed
+            + self.failed
+            != self.total_resumes
+        ):
+            raise ValueError(
+                "Run summary counts are inconsistent: "
+                "processed + failed must equal total_resumes."
+            )
+
+        if (
+            self.eligible
+            + self.rejected
+            != self.processed
+        ):
+            raise ValueError(
+                "Run summary counts are inconsistent: "
+                "eligible + rejected must equal processed."
+            )
+
+        return self
 
 
 # ============================================================
-# Final Results
+# FINAL SCREENING RESULTS
 # ============================================================
-
 
 class ScreeningResults(BaseModel):
-    """
-    Top-level object written to results.json.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
     run_summary: RunSummary
@@ -572,25 +662,20 @@ class ScreeningResults(BaseModel):
         default_factory=list
     )
 
-    @field_validator("ranked_candidates")
-    @classmethod
-    def validate_rank_order(
-        cls,
-        candidates: list[RankedCandidate],
-    ) -> list[RankedCandidate]:
+    @model_validator(mode="after")
+    def validate_ranks(self) -> "ScreeningResults":
         """
-        Ensure ranked candidates are actually ordered by rank.
+        Eligible candidates must have sequential ranks.
         """
 
         expected_rank = 1
 
-        for candidate in candidates:
+        for candidate in self.ranked_candidates:
             if candidate.rank != expected_rank:
                 raise ValueError(
-                    "Ranked candidates must have sequential ranks "
-                    "starting from 1."
+                    "Ranked candidates must have sequential ranks."
                 )
 
             expected_rank += 1
 
-        return candidates
+        return self
